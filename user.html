@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>用户端</title>
+    <script src="./vue.js"></script>
+    <script src="./axios.min.js"></script>
+</head>
+<body>
+<div id="app">
+    <h1>你好：{{nickname}}</h1>
+    <p v-if="serverErr" style="color: red">连接失败</p>
+    <div id="userDiv">
+        <h3>在线用户</h3>
+        <ul>
+            <li v-for="v in users">
+                <label @change="chose(v.fd)">
+                    <input name="users" type="radio"/>
+                    {{v.nickname}}
+                    <span style="color: red" v-show="v.hasNew" >●</span>
+                </label>
+            </li>
+        </ul>
+    </div>
+    <div id="msgDiv" ref="msgDiv">
+        <h3>{{topInfo}}</h3>
+        <ul>
+            <li v-for="v in msg">
+                <p class="time">{{v.time}}</p>
+                <p class="message"><span>{{v.fromNickname== nickname ? '我' : v.fromNickname}}:</span>{{v.content}}</p>
+            </li>
+        </ul>
+    </div>
+
+    <div id="inputDiv">
+        <textarea rows="12"  v-model="content" v-on:keyup.13="send"></textarea>
+    </div>
+    <div id="sendDiv" @click="send">
+        <button>发送</button>
+    </div>
+</div>
+
+
+</body>
+</html>
+
+<script>
+    axios.defaults.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    const WS_HOST='ws://192.168.10.10:9503';
+    const API_HOST='http://wschat.test/';
+
+    new Vue({
+        el: "#app",
+        data: {
+            socket: false,
+            msg: [],
+            nickname: "",
+            serverErr: false,
+            users: [],
+            myFd: "",
+            toFd: false,
+            content: ""
+        },
+        mounted: function () {
+            var me = this;
+
+            me.nickname = prompt('请输入你的昵称：');
+            if (!me.nickname) {
+                me.nickname='匿名:' +Math.floor(Math.random()*100);
+            }
+
+            //1. 创建websocket客户端
+            var socket = new WebSocket(WS_HOST);
+            console.log(socket);
+            //2. 注册事件
+
+            //2.1 连接成功后的回调函数
+            socket.onopen = function () {
+                me.socket = socket;
+                console.log('连接成功')
+            };
+
+            //2.2 当接收到服务端发来消息时的回调
+            socket.onmessage = function (e) {
+                console.log('服务端发来的消息:' + e.data);
+                var re = JSON.parse(e.data);
+                console.log(re);
+
+                //解析出action，作为方法名，动态调用
+                me[re.action](re);
+            };
+
+            //2.3 当断开连接时该回调执行
+            socket.onclose = function () {
+                console.log('断开了连接');
+            };
+
+            socket.onerror = function () {
+                me.serverErr = true;
+            }
+        },
+        methods: {
+            chose: function (fd) {
+                this.toFd = fd;
+                //去掉红标
+                for (var index in this.users) {
+                    if (this.users[index].fd == fd) {
+                        this.users[index].hasNew=false;
+                    }
+                }
+                //获取聊天记录
+                me=this;
+                axios.get(API_HOST+'getChat.php?fromFd=' + this.myFd + '&toFd=' + this.toFd)
+                    .then(function (response) {
+                        me.msg=response.data.data;
+                    });
+            },
+            send: function () {
+                if(!this.toFd){
+                    alert('请选择聊天对象');
+                    return;
+                }
+                var date = new Date();
+                var newdate = date.toLocaleString('chinese', {hour12: false});
+                this.msg.push({time: newdate, fromNickname: this.nickname, content: this.content});
+                data = {
+                    "action": "send",
+                    "data": {
+                        "toFd": this.toFd,
+                        "content": this.content,
+                    }
+                };
+
+                this.content = "";
+                this.socket.send(JSON.stringify(data));
+            },
+
+    //以下方法都是在服务端发来消息后，根据不同的action触发的
+
+            //当自己连接成功后，获取到自己的fd
+            newFd:function (re) {
+                this.myFd = re.data.fd;
+                //请求接口，存入redis，并获取列表
+                var me=this;
+                axios.get(API_HOST+'saveNewUser.php?fd=' + re.data.fd + '&nickname=' + me.nickname)
+                    .then(function (response) {
+                        console.log(response);
+                        me.users = response.data.data;
+                    });
+            },
+
+            //收到广播消息，有人上线
+            userIn:function (re) {
+                if (this.myFd != re.data.fd) {//用户列表中不显示自己
+                    var nickname = re.data.nickname;
+                    //加入在线用户列表中
+                    this.users.push({'fd': re.data.fd, 'nickname': nickname,'hasNew':false});
+                }
+            },
+
+            //收到广播消息，有人下线
+            userOff:function (re) {
+                var off_fd = re.data.fd;
+                if (this.toFd==off_fd){//如果是当前聊天对象下线
+                    this.toFd=false;
+                    var date = new Date();
+                    var newdate = date.toLocaleString('chinese', {hour12: false});
+                    this.msg.push({time: newdate, fromNickname: '系统消息', content:'用户已离线'});
+
+                }
+                //从在线用户中移出
+                for (var index in this.users) {
+                    if (this.users[index].fd == off_fd) {
+                        this.users.splice(index, 1);
+                    }
+                }
+            },
+
+            //收到私聊消息
+            newMsg:function (re) {
+                console.log('收到了私聊消息');
+                console.log(re.data);
+                if(re.data.fromFd==this.toFd){//如果新消息，就是当前聊天对象，那么就直接在聊天记录中增加
+                    this.msg.push(re.data);
+                    var div =  this.$refs.msgDiv;
+                    div.scrollTop = div.scrollHeight;
+                    console.log(div.scrollHeight);
+                }else{//否则的话，提示有其它人发来消息
+                    for (var index in this.users) {
+                        if (this.users[index].fd == re.data.fromFd) {
+                            this.users[index].hasNew=true;
+                        }
+                    }
+                }
+            }
+
+        },
+        computed:{
+            topInfo:function () {
+                if(this.toFd){
+                    for (var index in this.users) {
+                        if (this.users[index].fd == this.toFd) {
+                            var nickname= this.users[index].nickname;
+                            return '正在和【' + nickname + '】聊天';
+                        }
+                    }
+                }else{
+                    return '请选择聊天对象';
+                }
+            }
+        },
+        watch:{
+            msg:function () {
+                //自动滚动到底部
+                this.$nextTick(function () {
+                    var div =  this.$refs.msgDiv;
+                    div.scrollTop = div.scrollHeight;
+                    console.log(div.scrollHeight + ' top:' + div.scrollTop);
+                })
+            }
+        }
+    });
+
+
+</script>
+
+<style>
+    #userDiv {
+        width: 20%;
+        height: 700px;
+        border: 1px solid #eeeeee;
+        float: left;
+    }
+
+    #msgDiv {
+        width: 60%;
+        border: 1px solid #eeeeee;
+        height: 400px;
+        float: left;
+        margin-left: 2%;
+        overflow-y:auto ;
+
+    }
+
+    #inputDiv {
+        width: 60%;
+        height: 200px;
+        float: left;
+        margin-top: 2%;
+        margin-left: 2%;
+    }
+
+    #inputDiv textarea{
+        width: 98%;
+    }
+
+    #sendDiv {
+        width: 60%;
+        float: left;
+        margin-top: 2%;
+        margin-left: 2%;
+    }
+
+    #sendDiv button {
+        float: right;
+        margin-right: 5%;
+        width: 130px;
+        height: 30px;
+    }
+
+    .time {
+        margin: 0;
+        padding: 0;
+        font-size: 10px;
+    }
+
+    .message {
+        margin: 0;
+        padding: 0;
+    }
+</style>
